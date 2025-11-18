@@ -1,8 +1,8 @@
 ﻿TcpQueue
 
-This configuration is for Synology NAS Container Manager.
-
 This application communicates with a target one at the time effectively preventing multiple calls to the same target. 
+
+This configuration is for Synology NAS Container Manager.
 
 Use the YAML below to create your Docker project. Change the ports to your own.
 
