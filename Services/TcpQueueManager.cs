@@ -8,20 +8,20 @@ using TcpQueueProxy.Options;
 namespace TcpQueueProxy.Services
 {
     /// <summary>
-    /// Manages per-target queues. Each target gets its own worker that
-    /// processes sessions strictly sequentially.
+    /// Manages per-target queues. Each target has its own worker task.
+    /// A hung target session must never block other targets.
     /// </summary>
     public class TcpQueueManager : ITcpQueueManager
     {
         private readonly ConcurrentDictionary<string, TargetWorker> _workers = new();
-        private readonly ILogger<TcpQueueManager> _logger;
+        private readonly ILoggerFactory _loggerFactory;
         private readonly TcpQueueOptions _options;
 
         public TcpQueueManager(
-            ILogger<TcpQueueManager> logger,
+            ILoggerFactory loggerFactory,
             IOptions<TcpQueueOptions> options)
         {
-            _logger = logger;
+            _loggerFactory = loggerFactory;
             _options = options.Value;
         }
 
@@ -31,142 +31,197 @@ namespace TcpQueueProxy.Services
 
             var worker = _workers.GetOrAdd(key, k =>
             {
-                _logger.LogInformation("Creating queue worker for target {Target}", k);
-                return new TargetWorker(listenerConfig, _options.SessionTimeoutSeconds, _logger);
+                var logger = _loggerFactory.CreateLogger<TargetWorker>();
+                return new TargetWorker(
+                    listenerConfig,
+                    _options.SessionTimeoutSeconds,
+                    logger);
             });
 
             worker.Enqueue(client);
         }
 
         /// <summary>
-        /// Represents a worker for a single target (IP:Port).
-        /// It processes client sessions one-by-one using a Channel.
+        /// Worker for a single target (IP:Port).
+        /// Processes sessions one-by-one in its own task.
         /// </summary>
         private sealed class TargetWorker
         {
-            private readonly Channel<TcpClient> _channel;
             private readonly ListenerConfig _config;
             private readonly int _sessionTimeoutSeconds;
             private readonly ILogger _logger;
-            private readonly Task _processingTask;
-            private readonly CancellationTokenSource _cts = new();
 
-            public TargetWorker(ListenerConfig config, int sessionTimeoutSeconds, ILogger logger)
+            private readonly Channel<TcpClient> _channel;
+            private readonly CancellationTokenSource _workerCts;
+            private readonly Task _workerTask;
+
+            public TargetWorker(
+                ListenerConfig config,
+                int sessionTimeoutSeconds,
+                ILogger logger)
             {
                 _config = config;
                 _sessionTimeoutSeconds = sessionTimeoutSeconds;
                 _logger = logger;
 
+                // Unbounded queue for this target only
                 _channel = Channel.CreateUnbounded<TcpClient>(new UnboundedChannelOptions
                 {
                     SingleReader = true,
                     SingleWriter = false
                 });
 
-                _processingTask = Task.Run(ProcessQueueAsync);
+                // Worker lifetime CTS (per target, not global)
+                _workerCts = new CancellationTokenSource();
+
+                // Start the processing loop
+                _workerTask = Task.Run(ProcessQueueAsync);
             }
 
             public void Enqueue(TcpClient client)
             {
-                // Fire-and-forget, Channel is unbounded
-                _channel.Writer.TryWrite(client);
+                // Fire-and-forget: unbounded, so TryWrite should always succeed
+                if (!_channel.Writer.TryWrite(client))
+                {
+                    _logger.LogWarning(
+                        "Failed to enqueue client for target {Target}. Closing client.",
+                        _config.TargetKey);
+
+                    client.Close();
+                    client.Dispose();
+                }
             }
 
             private async Task ProcessQueueAsync()
             {
                 _logger.LogInformation(
-                    "Target worker for {Target} started",
-                    _config.TargetKey);
+                    "Target worker started for {Target} (Description: {Description})",
+                    _config.TargetKey,
+                    _config.Description);
 
                 try
                 {
-                    await foreach (var client in _channel.Reader.ReadAllAsync(_cts.Token))
+                    // Each target has its own queue and worker loop.
+                    // If one target hangs, only this worker is affected.
+                    await foreach (var client in _channel.Reader.ReadAllAsync(_workerCts.Token))
                     {
                         try
                         {
-                            await HandleSessionAsync(client);
+                            await HandleSessionAsync(client, _workerCts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Worker is being shut down
+                            client.Close();
+                            client.Dispose();
+                            break;
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex,
+                            _logger.LogError(
+                                ex,
                                 "Error while handling session for target {Target}",
                                 _config.TargetKey);
                         }
                         finally
                         {
-                            client.Close();
-                            client.Dispose();
+                            try
+                            {
+                                client.Close();
+                                client.Dispose();
+                            }
+                            catch
+                            {
+                                // ignore
+                            }
                         }
                     }
                 }
                 catch (OperationCanceledException)
                 {
-                    // Expected during shutdown
+                    // workerCts was cancelled -> normal shutdown
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex,
-                        "Fatal error in worker for target {Target}",
+                    _logger.LogError(
+                        ex,
+                        "Fatal error in worker loop for target {Target}",
                         _config.TargetKey);
                 }
 
                 _logger.LogInformation(
-                    "Target worker for {Target} stopped",
+                    "Target worker stopped for {Target}",
                     _config.TargetKey);
             }
 
-            private async Task HandleSessionAsync(TcpClient client)
+            private async Task HandleSessionAsync(TcpClient client, CancellationToken workerToken)
             {
-                // Only one session at a time per target; this method is called sequentially.
                 _logger.LogInformation(
-                    "Handling new session from {Remote} to target {Target}",
-                    client.Client.RemoteEndPoint,
-                    _config.TargetKey);
+                    "Starting session for target {Target} from {Remote}",
+                    _config.TargetKey,
+                    client.Client.RemoteEndPoint);
 
-                using var timeoutCts = new CancellationTokenSource(
+                // Per-session timeout to prevent hangs from blocking this worker forever
+                using var sessionTimeoutCts = new CancellationTokenSource(
                     TimeSpan.FromSeconds(_sessionTimeoutSeconds));
 
-                using var linkedCts =
-                    CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, timeoutCts.Token);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                    workerToken,
+                    sessionTimeoutCts.Token);
+
+                var token = linkedCts.Token;
 
                 using var targetClient = new TcpClient();
 
-                await targetClient.ConnectAsync(_config.TargetHost, _config.TargetPort, linkedCts.Token);
+                // Connect with timeout
+                await targetClient.ConnectAsync(_config.TargetHost, _config.TargetPort, token);
 
                 using NetworkStream clientStream = client.GetStream();
                 using NetworkStream targetStream = targetClient.GetStream();
 
-                // Bi-directional piping: one upstream (client -> target) and one
-                // downstream (target -> client). As soon as one direction ends,
-                // we cancel the other.
-                var t1 = PipeAsync(clientStream, targetStream, linkedCts.Token);
-                var t2 = PipeAsync(targetStream, clientStream, linkedCts.Token);
+                // Two pipes: client->target and target->client
+                var upstreamTask = PipeAsync(clientStream, targetStream, token);
+                var downstreamTask = PipeAsync(targetStream, clientStream, token);
 
-                var completed = await Task.WhenAny(t1, t2);
-                if (completed == t1)
+                // If one side finishes or times out, we cancel the other
+                var completed = await Task.WhenAny(upstreamTask, downstreamTask);
+
+                if (completed == upstreamTask)
                 {
-                    _logger.LogDebug("Client->Target pipe completed for {Target}", _config.TargetKey);
+                    _logger.LogDebug(
+                        "Upstream (client->target) completed for {Target}",
+                        _config.TargetKey);
                 }
                 else
                 {
-                    _logger.LogDebug("Target->Client pipe completed for {Target}", _config.TargetKey);
+                    _logger.LogDebug(
+                        "Downstream (target->client) completed for {Target}",
+                        _config.TargetKey);
                 }
 
-                // Cancel the other direction and wait for cleanup
+                // Cancel the other direction
                 linkedCts.Cancel();
+
                 try
                 {
-                    await Task.WhenAll(t1, t2);
+                    await Task.WhenAll(upstreamTask, downstreamTask);
                 }
                 catch (OperationCanceledException)
                 {
                     // Expected when we cancel
                 }
 
+                if (sessionTimeoutCts.IsCancellationRequested)
+                {
+                    _logger.LogWarning(
+                        "Session timeout for target {Target}. Session aborted.",
+                        _config.TargetKey);
+                }
+
                 _logger.LogInformation(
-                    "Session from {Remote} to {Target} finished",
-                    client.Client.RemoteEndPoint,
-                    _config.TargetKey);
+                    "Session finished for target {Target} from {Remote}",
+                    _config.TargetKey,
+                    client.Client.RemoteEndPoint);
             }
 
             private static async Task PipeAsync(
@@ -178,11 +233,10 @@ namespace TcpQueueProxy.Services
 
                 while (!cancellationToken.IsCancellationRequested)
                 {
-                    int bytesRead;
-#if NET9_0_OR_GREATER
-                    bytesRead = await source.ReadAsync(buffer, cancellationToken);
+#if NET9_0_OR_GREATER || NET10_0_OR_GREATER
+                    var bytesRead = await source.ReadAsync(buffer, cancellationToken);
 #else
-                    bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                    var bytesRead = await source.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
 #endif
                     if (bytesRead == 0)
                     {
@@ -190,7 +244,7 @@ namespace TcpQueueProxy.Services
                         break;
                     }
 
-#if NET9_0_OR_GREATER
+#if NET9_0_OR_GREATER || NET10_0_OR_GREATER
                     await destination.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
                     await destination.FlushAsync(cancellationToken);
 #else
@@ -202,7 +256,8 @@ namespace TcpQueueProxy.Services
 
             public void Stop()
             {
-                _cts.Cancel();
+                // Stop only this target worker
+                _workerCts.Cancel();
             }
         }
     }
