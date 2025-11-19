@@ -1,27 +1,24 @@
-# See https://aka.ms/customizecontainer to learn how to customize your debug container and how Visual Studio uses this Dockerfile to build your images for faster debugging.
-
-# This stage is used when running from VS in fast mode (Default for Debug configuration)
-FROM mcr.microsoft.com/dotnet/runtime:10.0 AS base
-WORKDIR /app
-
-
-# This stage is used to build the service project
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-ARG BUILD_CONFIGURATION=Release
+# Build stage
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
-COPY ["TCPQueue.csproj", "."]
-RUN dotnet restore "./TCPQueue.csproj"
+
+COPY *.csproj .
+RUN dotnet restore
+
 COPY . .
-WORKDIR "/src/."
-RUN dotnet build "./TCPQueue.csproj" -c $BUILD_CONFIGURATION -o /app/build
+RUN dotnet publish -c Release -o /app/publish --no-restore
 
-# This stage is used to publish the service project to be copied to the final stage
-FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "./TCPQueue.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+# Runtime stage
+FROM mcr.microsoft.com/dotnet/runtime:8.0-alpine AS final
+WORKDIR /app
+COPY --from=build /app/publish .
 
-# This stage is used in production or when running from VS in regular mode (Default when not using the Debug configuration)
-FROM base AS final
-WORKDIR /
-COPY --from=publish /app/publish .
-ENTRYPOINT ["dotnet", "TCPQueue.dll"]
+# Create volume for external configuration
+VOLUME /app/config
+
+# Expose commonly used ports — extend as needed
+EXPOSE 5000-5010/tcp
+
+HEALTHCHECK CMD nc -z localhost 5000 || exit 1
+
+ENTRYPOINT ["dotnet", "TcpQueueProxy.dll"]

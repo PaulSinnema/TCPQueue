@@ -2,45 +2,47 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using TcpQueueProxy.Options;
-using TcpQueueProxy.Services;
 
-var builder = Host.CreateApplicationBuilder(args);
+namespace TcpQueueProxy;
 
-string configDirectory = Environment.GetEnvironmentVariable("CONFIG_PATH") ?? AppContext.BaseDirectory;
-
-Console.WriteLine($"Configuration path: {configDirectory}");
-
-if (!Directory.Exists(configDirectory))
+/// <summary>
+/// Entry point of the TCP Queue Proxy application.
+/// Configures hosting, dependency injection, configuration sources and logging.
+/// </summary>
+public class Program
 {
-    Console.WriteLine($"Config directory does not exist: {configDirectory}");
+    /// <summary>
+    /// Main entry point. Starts the .NET Generic Host.
+    /// </summary>
+    public static async Task Main(string[] args) =>
+        await CreateHostBuilder(args).Build().RunAsync();
+
+    /// <summary>
+    /// Creates and configures the host builder with configuration, services and logging.
+    /// </summary>
+    public static IHostBuilder CreateHostBuilder(string[] args) =>
+        Host.CreateDefaultBuilder(args)
+            .ConfigureAppConfiguration((_, config) =>
+            {
+                config.SetBasePath(Directory.GetCurrentDirectory())
+                      .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                      .AddJsonFile("/app/config/appsettings.json", optional: true, reloadOnChange: true) // Docker volume
+                      .AddEnvironmentVariables();
+            })
+            .ConfigureServices((context, services) =>
+            {
+                services.Configure<ProxyConfig>(context.Configuration.GetSection("TcpQueue"));
+                services.AddSingleton<QueueManager>();
+                services.AddHostedService<TcpProxyService>();
+            })
+            .ConfigureLogging(logging =>
+            {
+                logging.ClearProviders();
+                logging.AddSimpleConsole(options =>
+                {
+                    options.IncludeScopes = true;
+                    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff ";
+                });
+                logging.SetMinimumLevel(LogLevel.Information);
+            });
 }
-
-string appSettingsPath = Path.Combine(configDirectory, "appsettings.json");
-
-Console.WriteLine($"Settings path: {appSettingsPath}");
-
-// Configuration
-if (File.Exists(appSettingsPath))
-{
-    builder.Configuration
-    .AddJsonFile(appSettingsPath, optional: false, reloadOnChange: true)
-    .AddEnvironmentVariables();
-}
-else
-{
-    Console.WriteLine("⚠️ Warning: appsettings.json missing!");
-}
-
-builder.Configuration.AddEnvironmentVariables();
-
-builder.Services.Configure<TcpQueueOptions>(builder.Configuration.GetSection("TcpQueue"));
-builder.Services.AddSingleton<ITcpQueueManager, TcpQueueManager>();
-builder.Services.AddHostedService<TcpListenerService>();
-
-// Logging
-builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
-
-var host = builder.Build();
-await host.RunAsync();
