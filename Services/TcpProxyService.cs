@@ -7,80 +7,90 @@ using System.Net.Sockets;
 
 namespace TcpQueueProxy;
 
-/// <summary>
-/// A high-performance TCP proxy that forwards raw TCP traffic while guaranteeing 
-/// that only one active connection exists at any time per target endpoint (sequencing).
-/// Perfect for devices/protocols that do not support concurrent connections (e.g. many Modbus devices, 
-/// Home Assistant HTTP API, cheap IoT devices, etc.).
-/// </summary>
 public sealed class TcpProxyService : BackgroundService
 {
     private readonly ProxyConfig _config;
     private readonly ILogger<TcpProxyService> _logger;
 
-    /// <summary>
-    /// One semaphore per unique target string. Ensures only one active connection per target.
-    /// </summary>
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _targetLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<TcpListener> _listeners = new();
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="TcpProxyService"/> class.
-    /// </summary>
-    /// <param name="config">Proxy configuration containing forwarding rules.</param>
-    /// <param name="logger">Logger instance.</param>
     public TcpProxyService(IOptions<ProxyConfig> config, ILogger<TcpProxyService> logger)
     {
         _config = config.Value;
         _logger = logger;
     }
 
-    /// <summary>
-    /// Starts all configured TCP listeners when the application host starts.
-    /// </summary>
-    /// <param name="stoppingToken">Cancellation token that signals application shutdown.</param>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _logger.LogInformation("TcpProxyService starting...");
+
+        // Start listeners
         foreach (var rule in _config.Forwards)
         {
             var listener = new TcpListener(IPAddress.Any, rule.ListenPort);
             listener.Start();
+            _listeners.Add(listener);
 
-            _logger.LogInformation("Listening on 0.0.0.0:{ListenPort} → {Target} (strict sequencing enabled)",
+            _logger.LogInformation(
+                "Listening on 0.0.0.0:{ListenPort} → {Target} (strict sequencing enabled)",
                 rule.ListenPort, rule.Target);
 
-            // Fire-and-forget accept loop – runs independently per listen port
-            _ = AcceptLoopAsync(listener, rule.Target, stoppingToken);
+            // Start accept loop per listener, maar met eigen taak
+            _ = Task.Run(() => AcceptLoopAsync(listener, rule.Target, stoppingToken), CancellationToken.None);
         }
 
-        // Keep the service alive until shutdown
-        await Task.Delay(Timeout.Infinite, stoppingToken).ConfigureAwait(false);
+        // Hou de service in leven totdat we een stop-signaal krijgen
+        try
+        {
+            await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // normaal bij shutdown
+        }
+
+        _logger.LogInformation("TcpProxyService stopping, closing listeners...");
+
+        foreach (var listener in _listeners)
+        {
+            try { listener.Stop(); } catch { /* ignore */ }
+        }
+
+        _logger.LogInformation("TcpProxyService stopped.");
     }
 
-    /// <summary>
-    /// Continuously accepts incoming clients on the specified listener and forwards them with sequencing.
-    /// </summary>
-    /// <param name="listener">The TCP listener.</param>
-    /// <param name="target">Target in "host:port" format.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
     private async Task AcceptLoopAsync(TcpListener listener, string target, CancellationToken cancellationToken)
     {
-        var (host, port) = ParseTarget(target);
-
-        // One semaphore per target → guarantees only one active connection at a time
         var semaphore = _targetLocks.GetOrAdd(target, _ => new SemaphoreSlim(1, 1));
 
         while (!cancellationToken.IsCancellationRequested)
         {
             TcpClient? client = null;
+
             try
             {
-                client = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+                // In plaats van AcceptTcpClientAsync(token): zelf pending checken
+                if (!listener.Pending())
+                {
+                    await Task.Delay(50, cancellationToken);
+                    continue;
+                }
 
-                // Wait until this target is free → enforces sequencing
-                await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+                client = listener.AcceptTcpClient(); // blocking, maar we checken zelf op cancellation
+                _logger.LogDebug("Accepted client {Client} for target {Target}",
+                    client.Client.RemoteEndPoint, target);
 
-                // Handle the client in a fire-and-forget task (lock is released in finally block)
-                _ = HandleClientWithSequencingAsync(client, host, port, semaphore, cancellationToken);
+                await semaphore.WaitAsync(cancellationToken);
+
+                try
+                {
+                    await HandleClientWithSequencingAsync(client, target, cancellationToken);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
             }
             catch (OperationCanceledException)
             {
@@ -88,77 +98,110 @@ public sealed class TcpProxyService : BackgroundService
             }
             catch (Exception ex)
             {
-                var localPort = listener.LocalEndpoint is IPEndPoint ipep ? ipep.Port : -1;
-                _logger.LogError(ex, $"Failed to accept client on port {localPort}");
+                _logger.LogError(ex, "Error in AcceptLoop for target {Target}", target);
                 client?.Close();
             }
         }
+
+        _logger.LogInformation("AcceptLoop for {Target} stopped.", target);
     }
 
-    /// <summary>
-    /// Handles a single client connection: connects to the target and performs bidirectional forwarding.
-    /// The semaphore guarantees exclusive access to the target.
-    /// </summary>
-    /// <param name="client">Accepted client from the listener.</param>
-    /// <param name="targetHost">Remote host to connect to.</param>
-    /// <param name="targetPort">Remote port to connect to.</param>
-    /// <param name="semaphore">Semaphore that protects the target.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
     private async Task HandleClientWithSequencingAsync(
         TcpClient client,
-        string targetHost,
-        int targetPort,
-        SemaphoreSlim semaphore,
-        CancellationToken cancellationToken)
+        string target,
+        CancellationToken serviceToken)
     {
+        client.NoDelay = true;
+
+        var targetParts = target.Split(':');
+        var targetHost = targetParts[0];
+        var targetPort = int.Parse(targetParts[1]);
+
+        using var upstream = new TcpClient();
+
+        // One overall timeout for this proxied exchange
+        using var opCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
+        opCts.CancelAfter(TimeSpan.FromSeconds(5)); // tune if needed
+
+        _logger.LogInformation("New client {Client} → {Target}: connecting upstream...",
+            client.Client.RemoteEndPoint, target);
+
+        await upstream.ConnectAsync(targetHost, targetPort, opCts.Token);
+        upstream.NoDelay = true;
+
         try
         {
-            using var upstream = new TcpClient();
-            await upstream.ConnectAsync(targetHost, targetPort, cancellationToken).ConfigureAwait(false);
-
-            await using var upstreamStream = upstream.GetStream();
             await using var clientStream = client.GetStream();
+            await using var upstreamStream = upstream.GetStream();
 
-            _logger.LogInformation("Sequenced connection established: {ClientEndpoint} → {TargetEndpoint}",
-                client.Client.LocalEndPoint,
-                upstream.Client.RemoteEndPoint);
+            _logger.LogInformation("Streams ready for {Target}", target);
 
-            // Bidirectional copy – raw TCP forwarding
-            var clientToTarget = clientStream.CopyToAsync(upstreamStream, 81920, cancellationToken);
-            var targetToClient = upstreamStream.CopyToAsync(clientStream, 81920, cancellationToken);
-
-            // Wait for either direction to close
-            await Task.WhenAny(clientToTarget, targetToClient).ConfigureAwait(false);
+            await CopyWithLoggingAsync(clientStream, upstreamStream, target, "client→upstream", opCts.Token);
+            await CopyWithLoggingAsync(upstreamStream, clientStream, target, "upstream→client", opCts.Token);
         }
         catch (OperationCanceledException)
         {
-            // Expected during shutdown
+            _logger.LogWarning("Proxy operation for {Target} timed out", target);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!serviceToken.IsCancellationRequested)
         {
-            _logger.LogDebug(ex, "Connection closed (client or target disconnected)");
+            _logger.LogError(ex, "Proxy error {Client} → {Target}",
+                client.Client.RemoteEndPoint, target);
         }
         finally
         {
-            // Always release the lock – even on error or cancellation
-            semaphore.Release();
-            try { client.Close(); }
-            catch { /* ignore */ }
+            try { client.Close(); } catch { /* ignore */ }
+            try { upstream.Close(); } catch { /* ignore */ }
+
+            _logger.LogInformation("Closed client and upstream for {Target}", target);
         }
     }
 
-    /// <summary>
-    /// Parses a target string in "host:port" format.
-    /// </summary>
-    /// <param name="target">The target string.</param>
-    /// <returns>A tuple containing host and port.</returns>
-    /// <exception cref="FormatException">Thrown when the format is invalid.</exception>
-    private static (string host, int port) ParseTarget(string target)
+    // Helper, so you also log per direction & see if er bytes lopen
+    private async Task CopyWithLoggingAsync(
+        NetworkStream source,
+        NetworkStream destination,
+        string target,
+        string direction,
+        CancellationToken ct)
     {
-        var parts = target.Split(':');
-        if (parts.Length != 2 || !int.TryParse(parts[1], out var port))
-            throw new FormatException($"Invalid target format: '{target}'. Expected 'host:port'.");
+        var bufferSize = 81920;
+        var totalBytes = 0L;
 
-        return (parts[0], port);
+        try
+        {
+            var buffer = new byte[bufferSize];
+
+            while (!source.DataAvailable)
+            {
+                _logger.LogDebug($"No data available yet for {target}");
+            }
+
+            while (!ct.IsCancellationRequested && source.DataAvailable)
+            {
+                var read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
+
+                await destination.WriteAsync(buffer.AsMemory(0, read), ct);
+                await destination.FlushAsync(ct);
+
+                await Task.Delay(50);
+                
+                totalBytes += read;
+            }
+
+            _logger.LogDebug("Copy {Direction} for {Target} finished, total bytes: {Bytes}",
+                direction, target, totalBytes);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Copy {Direction} for {Target} cancelled/timeout after {Bytes} bytes",
+                direction, target, totalBytes);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Copy {Direction} for {Target} failed after {Bytes} bytes",
+                direction, target, totalBytes);
+            throw;
+        }
     }
 }
