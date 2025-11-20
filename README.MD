@@ -1,47 +1,55 @@
 ﻿TcpQueue
 
-This application communicates with a target one at the time effectively preventing multiple calls to the same target. 
+This application communicates with a target one at the time effectively preventing multiple calls to the same target.
+You need this when a target is not multi threaded and gets confused when more than 1 call arrives.
 
-This configuration is for Synology NAS Container Manager.
+The project is not yet uploaded to Docker Library. Will do that soon. Until then you need to download (pull) the 
+sources to your local machine and build it with Visual Studio 2026 (Insiders) or Visual Studio 2023.
+You also need the 'registry' container (https://hub.docker.com/_/registry/) to be able to have your local
+registry on your Synology NAS (or use the Docker Library) to upload to the registry and download the image into
+the Container Manager on your Synology NAS.
 
-Use the YAML below to create your Docker project. Change the ports to your own.
+This configuration is for Synology NAS Container Manager. Use the YAML below to create your Docker project.
+Change the IP addresses and ports to your own.
 
-version: "3.9"
+    version: "3.9"
 
-services:
-  tcpqueue:
-    container_name: tcpqueue
+    services:
+      tcpqueue:
+        container_name: tcpqueue
 
-    # GEBRUIK EEN BESTAANDE IMAGE
-    image: 192.168.1.201:5000/tcpqueue:latest
-    restart: unless-stopped
-    
+        # GEBRUIK EEN BESTAANDE IMAGE
+        image: 192.168.1.201:5000/tcpqueue:latest   # pas aan als jouw tag anders is
+        restart: unless-stopped
+        # network_mode: host
 
-   # EXPOSE
-    expose:
-      - "15217"
-      - "15240"
-      - "15241"
-      - "15242"
-      - "15243"
+       # EXPOSE = alleen intern zichtbaar voor andere containers
+        expose:
+          - "15217"
+          - "15240"
+          - "15241"
+          - "15242"
+          - "15243"
 
-    # Ports = publiceren naar jouw Windows host
-    ports:
-      - "15217:15217"
-      - "15240:15240"
-      - "15241:15241"
-      - "15242:15242"
-      - "15243:15243" 
+        # Ports = publiceren naar jouw Windows host
+        ports:
+          - "15217:15217"
+          - "15240:15240"
+          - "15241:15241"
+          - "15242:15242"
+          - "15243:15243" 
       
-    # run als root zodat je config-map leesbaar is
-    # user: "0:0"
+        # run als root zodat je config-map leesbaar is
+        # user: "0:0"
 
-    environment:
-      CONFIG_PATH: "/config"
+        environment:
+          CONFIG_PATH: "/config"
 
-    volumes:
-      - /volume1/containers/tcpqueue/config:/config:ro,z
-Put the following appsettings.json on your Synology NAS in the directory specified in the YAML file under Volumes: (in the example: /volume1/containers/tcpqueue:/tcpqueue).
+        volumes:
+          - /volume1/containers/tcpqueue/config:/config:ro,z
+
+Put the following appsettings.json on your Synology NAS in the directory specified in the YAML file under Volumes:
+(in the example: /volume1/containers/tcpqueue:/tcpqueue).
 
    {
   "TcpQueue": {
@@ -76,7 +84,7 @@ Put the following appsettings.json on your Synology NAS in the directory specifi
   "Logging": {
     "LogLevel": {
       "Default": "Warning",
-      "TcpQueueProxy": "Information"
+      "TcpQueueProxy": "Warning"
     }
   }
 }
