@@ -24,6 +24,7 @@ public sealed class TcpProxyService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("TcpProxyService starting...");
+        List<Task> tasks = new List<Task>();
 
         // Start listeners
         foreach (var rule in _config.Forwards)
@@ -37,18 +38,12 @@ public sealed class TcpProxyService : BackgroundService
                 rule.ListenPort, rule.Target);
 
             // Start accept loop per listener, maar met eigen taak
-            _ = Task.Run(() => AcceptLoopAsync(listener, rule.Target, stoppingToken), CancellationToken.None);
+            var task = AcceptLoopAsync(listener, rule.Target, stoppingToken);
+
+            tasks.Add(task);
         }
 
-        // Hou de service in leven totdat we een stop-signaal krijgen
-        try
-        {
-            await Task.Delay(Timeout.Infinite, stoppingToken);
-        }
-        catch (OperationCanceledException)
-        {
-            // normaal bij shutdown
-        }
+        await Task.WhenAll(tasks);
 
         _logger.LogInformation("TcpProxyService stopping, closing listeners...");
 
@@ -62,44 +57,32 @@ public sealed class TcpProxyService : BackgroundService
 
     private async Task AcceptLoopAsync(TcpListener listener, string target, CancellationToken cancellationToken)
     {
-        var semaphore = _targetLocks.GetOrAdd(target, _ => new SemaphoreSlim(1, 1));
-
         while (!cancellationToken.IsCancellationRequested)
         {
             TcpClient? client = null;
 
             try
             {
-                // In plaats van AcceptTcpClientAsync(token): zelf pending checken
-                if (!listener.Pending())
-                {
-                    await Task.Delay(50, cancellationToken);
-                    continue;
-                }
+                client = await listener.AcceptTcpClientAsync(cancellationToken);
 
-                client = listener.AcceptTcpClient(); // blocking, maar we checken zelf op cancellation
                 _logger.LogDebug("Accepted client {Client} for target {Target}",
-                    client.Client.RemoteEndPoint, target);
+                        client.Client.RemoteEndPoint, target);
 
-                await semaphore.WaitAsync(cancellationToken);
-
-                try
-                {
-                    await HandleClientWithSequencingAsync(client, target, cancellationToken);
-                }
-                finally
-                {
-                    semaphore.Release();
-                }
+                await HandleClientWithSequencingAsync(client, target, cancellationToken);
             }
             catch (OperationCanceledException)
             {
-                break;
+                // Do nothing
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error in AcceptLoop for target {Target}", target);
+                _logger.LogError(ex, $"Error in AcceptLoop for target {target}");
+
+            }
+            finally
+            {
                 client?.Close();
+                client?.Dispose();
             }
         }
 
@@ -111,49 +94,60 @@ public sealed class TcpProxyService : BackgroundService
         string target,
         CancellationToken serviceToken)
     {
-        client.NoDelay = true;
+        var semaphore = _targetLocks.GetOrAdd(target, _ => new SemaphoreSlim(1, 1));
 
-        var targetParts = target.Split(':');
-        var targetHost = targetParts[0];
-        var targetPort = int.Parse(targetParts[1]);
-
-        using var upstream = new TcpClient();
-
-        // One overall timeout for this proxied exchange
-        using var opCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
-        opCts.CancelAfter(TimeSpan.FromSeconds(5)); // tune if needed
-
-        _logger.LogInformation("New client {Client} → {Target}: connecting upstream...",
-            client.Client.RemoteEndPoint, target);
-
-        await upstream.ConnectAsync(targetHost, targetPort, opCts.Token);
-        upstream.NoDelay = true;
+        await semaphore.WaitAsync(serviceToken);
 
         try
         {
-            await using var clientStream = client.GetStream();
-            await using var upstreamStream = upstream.GetStream();
+            client.NoDelay = true;
 
-            _logger.LogInformation("Streams ready for {Target}", target);
+            var targetParts = target.Split(':');
+            var targetHost = targetParts[0];
+            var targetPort = int.Parse(targetParts[1]);
 
-            await CopyWithLoggingAsync(clientStream, upstreamStream, target, "client→upstream", opCts.Token);
-            await CopyWithLoggingAsync(upstreamStream, clientStream, target, "upstream→client", opCts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            _logger.LogWarning("Proxy operation for {Target} timed out", target);
-        }
-        catch (Exception ex) when (!serviceToken.IsCancellationRequested)
-        {
-            _logger.LogError(ex, "Proxy error {Client} → {Target}",
+            using var upstream = new TcpClient();
+
+            // One overall timeout for this proxied exchange
+            using var opCts = CancellationTokenSource.CreateLinkedTokenSource(serviceToken);
+            opCts.CancelAfter(TimeSpan.FromSeconds(5)); // tune if needed
+
+            _logger.LogInformation("New client {Client} → {Target}: connecting upstream...",
                 client.Client.RemoteEndPoint, target);
+
+            await upstream.ConnectAsync(targetHost, targetPort, opCts.Token);
+            upstream.NoDelay = true;
+
+            try
+            {
+                await using var clientStream = client.GetStream();
+                await using var upstreamStream = upstream.GetStream();
+
+                _logger.LogInformation("Streams ready for {Target}", target);
+
+                await CopyWithLoggingAsync(clientStream, upstreamStream, target, "client→upstream", opCts.Token);
+                await CopyWithLoggingAsync(upstreamStream, clientStream, target, "upstream→client", opCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("Proxy operation for {Target} timed out", target);
+            }
+            catch (Exception ex) when (!serviceToken.IsCancellationRequested)
+            {
+                _logger.LogError(ex, "Proxy error {Client} → {Target}",
+                    client.Client.RemoteEndPoint, target);
+            }
+            finally
+            {
+                try { client.Close(); } catch { /* ignore */ }
+                try { upstream.Close(); } catch { /* ignore */ }
+
+                _logger.LogInformation("Closed client and upstream for {Target}", target);
+            }
         }
         finally
         {
-            try { client.Close(); } catch { /* ignore */ }
-            try { upstream.Close(); } catch { /* ignore */ }
-
-            _logger.LogInformation("Closed client and upstream for {Target}", target);
+            semaphore.Release();
         }
     }
 
@@ -185,7 +179,7 @@ public sealed class TcpProxyService : BackgroundService
                 await destination.FlushAsync(ct);
 
                 await Task.Delay(50);
-                
+
                 totalBytes += read;
             }
 

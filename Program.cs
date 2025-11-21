@@ -2,6 +2,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using TcpQueueProxy.Extensions;
 
 namespace TcpQueueProxy;
 
@@ -9,6 +10,15 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) =>
+        {
+            var senderType = sender?.GetType() ?? null;
+            var ex = (Exception)eventArgs.ExceptionObject;
+
+            Console.WriteLine($"🚨 Critical unhandled exception occurred: {ex.ToDetailedString()}");
+            Console.WriteLine($"Sender is: {senderType?.FullName} IsTerminating: {eventArgs.IsTerminating}");
+        };
+
         await CreateHostBuilder(args).Build().RunAsync();
     }
 
